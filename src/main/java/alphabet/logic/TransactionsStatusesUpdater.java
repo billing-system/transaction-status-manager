@@ -5,6 +5,7 @@ import com.google.gson.JsonSyntaxException;
 import dal.TransactionRepository;
 import enums.DbTransactionStatus;
 import exceptions.ProcessorException;
+import external.api.TransactionDirection;
 import logger.BillingSystemLogger;
 import models.db.BillingTransaction;
 import org.springframework.data.jpa.repository.Lock;
@@ -65,7 +66,7 @@ public class TransactionsStatusesUpdater {
         String report = processorWrapper.downloadReport();
         Map<String, ReportTransactionStatus> transactionIdToReportStatusMap = reportToMapConvertor.convert(report);
         List<String> reportTransactionsIds = new ArrayList<>(transactionIdToReportStatusMap.keySet());
-        List<BillingTransaction> dbTransactions = transactionRepository.findByIdIn(reportTransactionsIds);
+        List<BillingTransaction> dbTransactions = fetchSentTransactionsThatExistInReport(reportTransactionsIds);
 
         dbTransactions.forEach(dbTransaction ->
                 updateDbTransactionStatus(dbTransaction, transactionIdToReportStatusMap));
@@ -73,16 +74,46 @@ public class TransactionsStatusesUpdater {
         saveUpdatedTransactionsInDb(dbTransactions);
     }
 
+    private List<BillingTransaction> fetchSentTransactionsThatExistInReport(List<String> reportTransactionsIds) {
+        return transactionRepository.findByTransactionStatusAndIdIn(DbTransactionStatus.SENT_TRANSACTION,
+                reportTransactionsIds);
+    }
+
     private void updateDbTransactionStatus(BillingTransaction dbTransaction,
                                            Map<String, ReportTransactionStatus> transactionIdToReportStatusMap) {
-        DbTransactionStatus newDbTransactionStatus = computeDbTransactionNewStatus(dbTransaction,
+        ReportTransactionStatus reportTransactionStatus = extractTransactionNewStatus(dbTransaction,
                 transactionIdToReportStatusMap);
 
-        if (!newDbTransactionStatus.equals(dbTransaction.getTransactionStatus())) {
-            logger.log(Level.INFO, "Received the transaction result of " + dbTransaction.getTransactionId() +
-                    " and updated its " + "status to " + newDbTransactionStatus);
-            dbTransaction.setTransactionStatus(newDbTransactionStatus);
+        logger.log(Level.INFO, "The transaction result of " + dbTransaction.getTransactionId() +
+                " is: " + reportTransactionStatus);
+
+        DbTransactionStatus newDbTransactionStatus =
+                computeNewDbTransactionStatus(dbTransaction, reportTransactionStatus);
+        dbTransaction.setTransactionStatus(newDbTransactionStatus);
+    }
+
+    private ReportTransactionStatus extractTransactionNewStatus(BillingTransaction dbTransaction,
+                                                                Map<String, ReportTransactionStatus> transactionIdToReportStatusMap) {
+        String dbTransactionId = dbTransaction.getTransactionId();
+
+        return transactionIdToReportStatusMap.get(dbTransactionId);
+    }
+
+    private DbTransactionStatus computeNewDbTransactionStatus(BillingTransaction dbTransaction,
+                                                              ReportTransactionStatus reportTransactionStatus) {
+        if (isCreditTransactionWithFailedStatus(dbTransaction, reportTransactionStatus)) {
+            return DbTransactionStatus.WAITING_TO_BE_SENT;
+        } else {
+            return reportToDbTransactionStatusConvertor.convert(reportTransactionStatus);
         }
+    }
+
+    private boolean isCreditTransactionWithFailedStatus(BillingTransaction dbTransaction,
+                                                        ReportTransactionStatus reportTransactionStatus) {
+        TransactionDirection dbTransactionDirection = dbTransaction.getTransactionDirection();
+
+        return dbTransactionDirection.equals(TransactionDirection.CREDIT) &&
+                reportTransactionStatus.equals(ReportTransactionStatus.FAIL);
     }
 
     private void saveUpdatedTransactionsInDb(List<BillingTransaction> dbTransactions) {
@@ -95,13 +126,5 @@ public class TransactionsStatusesUpdater {
         } else {
             logger.log(Level.FINE, "Didn't update any transaction saved in the db");
         }
-    }
-
-    private DbTransactionStatus computeDbTransactionNewStatus(BillingTransaction dbTransaction,
-                                                              Map<String, ReportTransactionStatus> transactionIdToReportStatusMap) {
-        String dbTransactionId = dbTransaction.getTransactionId();
-        ReportTransactionStatus reportTransactionStatus = transactionIdToReportStatusMap.get(dbTransactionId);
-
-        return reportToDbTransactionStatusConvertor.convert(reportTransactionStatus);
     }
 }
